@@ -13,6 +13,7 @@
 #include <memory>
 #include <deque>
 #include <mutex>
+#include <atomic>
 
 namespace asio = boost::asio;
 namespace beast = boost::beast;
@@ -32,7 +33,10 @@ public:
     ~websocket_session()
     {
         if (!_ws_context.uuid.empty()) {
-            _route.disconnect(_ws_context);
+            try {
+                _route.disconnect(_ws_context);
+            } catch (...) {
+            }
         }
     }
 
@@ -68,6 +72,9 @@ public:
                 });
     }
 
+    // Messages dropped because the outbound queue was full (slow consumer).
+    uint64_t get_dropped_count() const { return _dropped_count; }
+
 private:
     beast::websocket::stream<beast::tcp_stream> _websocket;
     beast::flat_buffer _buffer;
@@ -80,6 +87,7 @@ private:
     };
 
     std::deque<message> _queue;
+    std::atomic<uint64_t> _dropped_count{0};
     // The session runs on a plain (multi-threaded) io_context executor: posted
     // do_write calls and on_write completions can interleave on different
     // threads, so every access to _queue and the write chain is serialized.
@@ -89,6 +97,10 @@ private:
     void on_accept(beast::error_code ec)
     {
         if (ec) {
+            {
+                std::lock_guard<std::mutex> lock(_write_mutex);
+                _queue.clear();
+            }
             return fail(ec, "accept");
         }
 
@@ -115,10 +127,19 @@ private:
     void on_read(beast::error_code ec, std::size_t)
     {
         //std::cout << "websocket_session: " << _ws_context.uuid << " - on read" << std::endl;
-        if (ec == beast::websocket::error::closed)
+        if (ec == beast::websocket::error::closed) {
+            {
+                std::lock_guard<std::mutex> lock(_write_mutex);
+                _queue.clear();
+            }
             return;
+        }
 
         if (ec) {
+            {
+                std::lock_guard<std::mutex> lock(_write_mutex);
+                _queue.clear();
+            }
             return fail(ec, "read");
         }
 
@@ -131,6 +152,11 @@ private:
     void do_write(std::string&& str, bool binary_mode)
     {
         std::lock_guard<std::mutex> lock(_write_mutex);
+        constexpr size_t MAX_QUEUE_SIZE = 100;
+        if (_queue.size() >= MAX_QUEUE_SIZE) {
+            ++_dropped_count;
+            return;
+        }
         message msg;
         msg.buffer = std::move(str);
         msg.binary_mode = binary_mode;
@@ -138,6 +164,11 @@ private:
 
         // Are we already writing?
         if(_queue.size() > 1) {
+            return;
+        }
+
+        if (!_websocket.is_open()) {
+            _queue.clear();
             return;
         }
 
@@ -159,8 +190,12 @@ private:
             return fail(ec, "write");
         }
 
-        _queue.pop_front();
+        // Remove the completed message first
+        if (!_queue.empty()) {
+            _queue.pop_front();
+        }
 
+        // Continue writing if there are more messages
         if (!_queue.empty()) {
             _websocket.binary(_queue.front().binary_mode);
 
